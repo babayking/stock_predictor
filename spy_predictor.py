@@ -10,6 +10,7 @@ import os
 import logging
 import pickle
 from pathlib import Path
+import time
 
 # Setup logging
 logging.basicConfig(
@@ -21,8 +22,196 @@ logging.basicConfig(
     ]
 )
 
+class FinancialDataFetcher:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://finnhub.io/api/v1"
+    
+    def get_spy_data(self, from_date, to_date):
+        """Fetch SPY historical data from Finnhub."""
+        endpoint = f"{self.base_url}/stock/candle"
+        
+        params = {
+            'symbol': 'SPY',
+            'resolution': 'D',
+            'from': int(from_date.timestamp()),
+            'to': int(to_date.timestamp()),
+            'token': self.api_key
+        }
+        
+        try:
+            response = requests.get(endpoint, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('s') == 'ok':
+                    df = pd.DataFrame({
+                        'timestamp': data['t'],
+                        'open': data['o'],
+                        'high': data['h'],
+                        'low': data['l'],
+                        'close': data['c'],
+                        'volume': data['v']
+                    })
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+                    df.set_index('timestamp', inplace=True)
+                    return df
+            logging.error(f"Failed to fetch data: {response.text}")
+            return None
+        except Exception as e:
+            logging.error(f"Error fetching data: {str(e)}")
+            return None
+
+class FinancialFeatureExtractor:
+    @staticmethod
+    def calculate_features(df):
+        """Calculate technical indicators and features."""
+        # Price changes
+        df['returns'] = df['close'].pct_change()
+        df['price_change'] = df['close'] - df['open']
+        
+        # Volatility (20-day)
+        df['volatility'] = df['returns'].rolling(window=20).std()
+        
+        # RSI (14-day)
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp1 - exp2
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        
+        # Clean up NaN values
+        df.dropna(inplace=True)
+        return df
+
+class SPYPredictor:
+    def __init__(
+        self,
+        feature_columns,
+        num_actions=100,
+        gamma=0.95,
+        epsilon=1.0,
+        epsilon_decay=0.995
+    ):
+        self.feature_columns = feature_columns
+        self.num_actions = num_actions
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        
+        # State size is the number of features
+        self.state_size = len(feature_columns)
+        
+        # Q-Network
+        self.q_network = nn.Sequential(
+            nn.Linear(self.state_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, num_actions)
+        )
+        
+        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=0.001)
+        
+        # Initialize history
+        self.history = {
+            'actual_values': [],
+            'predicted_values': [],
+            'errors': [],
+            'rewards': [],
+            'epsilon': []
+        }
+        
+        # Initialize scalers
+        self.scalers = {}
+    
+    def fit_scalers(self, df):
+        """Fit scalers to the feature data."""
+        for column in self.feature_columns:
+            min_val = df[column].min()
+            max_val = df[column].max()
+            self.scalers[column] = (min_val, max_val)
+    
+    def _normalize_features(self, features):
+        """Normalize features using fitted scalers."""
+        normalized = []
+        for i, column in enumerate(self.feature_columns):
+            min_val, max_val = self.scalers[column]
+            value = (features[i] - min_val) / (max_val - min_val) if max_val > min_val else 0
+            normalized.append(value)
+        return normalized
+    
+    def _get_state(self, features):
+        """Create state from features."""
+        normalized_features = self._normalize_features(features)
+        return torch.FloatTensor(normalized_features).unsqueeze(0)
+    
+    def _get_reward(self, prediction, actual):
+        """Calculate reward based on prediction accuracy."""
+        pct_error = abs((prediction - actual) / actual)
+        return -pct_error
+    
+    def predict(self, features):
+        """Choose action (prediction) using epsilon-greedy policy."""
+        state = self._get_state(features)
+        
+        if np.random.random() < self.epsilon:
+            action_idx = np.random.randint(0, self.num_actions)
+        else:
+            with torch.no_grad():
+                q_values = self.q_network(state)
+                action_idx = q_values.argmax().item()
+        
+        self.epsilon = max(0.01, self.epsilon * self.epsilon_decay)
+        
+        min_price = min(self.history['actual_values']) if self.history['actual_values'] else 0
+        max_price = max(self.history['actual_values']) if self.history['actual_values'] else 100
+        price_range = np.linspace(min_price, max_price, self.num_actions)
+        
+        return price_range[action_idx]
+    
+    def update(self, features, actual_value):
+        """Update Q-network using the observed reward."""
+        self.history['actual_values'].append(actual_value)
+        
+        prediction = self.predict(features)
+        self.history['predicted_values'].append(prediction)
+        
+        reward = self._get_reward(prediction, actual_value)
+        self.history['rewards'].append(reward)
+        self.history['epsilon'].append(self.epsilon)
+        
+        error = abs(prediction - actual_value)
+        self.history['errors'].append(error)
+        
+        self._train(features, reward)
+        
+        return error
+    
+    def _train(self, features, reward):
+        """Train Q-network using current transition."""
+        state = self._get_state(features)
+        
+        with torch.no_grad():
+            next_q_values = self.q_network(state)
+            next_q_value = next_q_values.max()
+            target_q_value = reward + self.gamma * next_q_value
+        
+        q_values = self.q_network(state)
+        current_q_value = q_values[0, q_values[0].argmax()]
+        
+        loss = (current_q_value - target_q_value) ** 2
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
 class ModelState:
-    """Class to handle model state persistence."""
     def __init__(self, base_path='model_state'):
         self.base_path = Path(base_path)
         self.base_path.mkdir(exist_ok=True)
@@ -34,18 +223,14 @@ class ModelState:
     
     def save_state(self, predictor, metadata):
         """Save complete model state."""
-        # Save PyTorch model
         torch.save(predictor.q_network.state_dict(), self.model_path)
         
-        # Save scalers
         with open(self.scalers_path, 'wb') as f:
             pickle.dump(predictor.scalers, f)
         
-        # Save history
         with open(self.history_path, 'wb') as f:
             pickle.dump(predictor.history, f)
         
-        # Save metadata
         with open(self.metadata_path, 'w') as f:
             json.dump(metadata, f)
         
@@ -58,20 +243,14 @@ class ModelState:
             logging.info("No previous state found")
             return None
         
-        # Load PyTorch model
-        predictor.q_network.load_state_dict(
-            torch.load(self.model_path)
-        )
+        predictor.q_network.load_state_dict(torch.load(self.model_path))
         
-        # Load scalers
         with open(self.scalers_path, 'rb') as f:
             predictor.scalers = pickle.load(f)
         
-        # Load history
         with open(self.history_path, 'rb') as f:
             predictor.history = pickle.load(f)
         
-        # Load metadata
         with open(self.metadata_path, 'r') as f:
             metadata = json.load(f)
         
@@ -79,7 +258,6 @@ class ModelState:
         return metadata
 
 class PerformanceTracker:
-    """Track and analyze model performance over time."""
     def __init__(self, base_path='performance'):
         self.base_path = Path(base_path)
         self.base_path.mkdir(exist_ok=True)
@@ -88,7 +266,6 @@ class PerformanceTracker:
         self.initialize_metrics_file()
     
     def initialize_metrics_file(self):
-        """Create metrics file if it doesn't exist."""
         if not self.daily_metrics_path.exists():
             pd.DataFrame(columns=[
                 'date', 'mae', 'rmse', 'correct_direction_pct',
@@ -96,20 +273,16 @@ class PerformanceTracker:
             ]).to_csv(self.daily_metrics_path, index=False)
     
     def calculate_daily_metrics(self, predictor, actual_prices):
-        """Calculate performance metrics for the day."""
         predictions = predictor.history['predicted_values'][-len(actual_prices):]
         
-        # Basic error metrics
         errors = np.abs(np.array(predictions) - np.array(actual_prices))
         mae = np.mean(errors)
         rmse = np.sqrt(np.mean(errors**2))
         
-        # Direction prediction accuracy
         actual_direction = np.diff(actual_prices) > 0
         predicted_direction = np.diff(predictions) > 0
         direction_accuracy = np.mean(actual_direction == predicted_direction)
         
-        # Return metrics
         returns = np.diff(actual_prices) / actual_prices[:-1]
         avg_return = np.mean(returns)
         sharpe_ratio = np.mean(returns) / np.std(returns) if len(returns) > 1 else 0
@@ -123,98 +296,17 @@ class PerformanceTracker:
             'sharpe_ratio': sharpe_ratio
         }
         
-        # Append to CSV
         pd.DataFrame([metrics]).to_csv(
             self.daily_metrics_path, mode='a', header=False, index=False
         )
         
         return metrics
-    
-    def plot_performance_evolution(self):
-        """Plot how model performance has evolved over time."""
-        metrics_df = pd.read_csv(self.daily_metrics_path)
-        metrics_df['date'] = pd.to_datetime(metrics_df['date'])
-        
-        plt.figure(figsize=(15, 10))
-        
-        # Plot MAE over time
-        plt.subplot(2, 2, 1)
-        plt.plot(metrics_df['date'], metrics_df['mae'])
-        plt.title('Mean Absolute Error Over Time')
-        plt.xticks(rotation=45)
-        plt.grid(True)
-        
-        # Plot direction prediction accuracy
-        plt.subplot(2, 2, 2)
-        plt.plot(metrics_df['date'], metrics_df['correct_direction_pct'])
-        plt.title('Direction Prediction Accuracy Over Time')
-        plt.xticks(rotation=45)
-        plt.grid(True)
-        
-        # Plot Sharpe ratio
-        plt.subplot(2, 2, 3)
-        plt.plot(metrics_df['date'], metrics_df['sharpe_ratio'])
-        plt.title('Sharpe Ratio Over Time')
-        plt.xticks(rotation=45)
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(self.base_path / 'performance_evolution.png')
-        plt.close()
-
-def create_github_workflow():
-    """Create GitHub Actions workflow file."""
-    workflow_dir = Path('.github/workflows')
-    workflow_dir.mkdir(parents=True, exist_ok=True)
-    
-    workflow_content = """
-name: SPY Predictor Training
-
-on:
-  schedule:
-    - cron: '0 0 * * *'  # Run daily at midnight UTC
-  workflow_dispatch:  # Allow manual triggers
-
-jobs:
-  train:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v2
-    
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.9'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install torch pandas numpy requests matplotlib
-    
-    - name: Run predictor
-      env:
-        FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-      run: python spy_predictor.py
-    
-    - name: Commit changes
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add model_state/* performance/*
-        git commit -m "Update model state and performance metrics" || echo "No changes to commit"
-        git push
-    """
-    
-    with open(workflow_dir / 'spy_predictor.yml', 'w') as f:
-        f.write(workflow_content.strip())
 
 def run_continuous_training(api_key, days_to_run=30):
     """Run continuous training loop."""
     model_state = ModelState()
     performance_tracker = PerformanceTracker()
     
-    # Initialize or load predictor
     predictor = SPYPredictor(feature_columns=[
         'returns', 'volatility', 'rsi', 'macd',
         'macd_signal', 'price_change'
@@ -224,12 +316,19 @@ def run_continuous_training(api_key, days_to_run=30):
     last_update = (datetime.fromisoformat(metadata['last_update']) 
                   if metadata else datetime.now() - timedelta(days=1))
     
-    # Create data fetcher
     fetcher = FinancialDataFetcher(api_key)
+    
+    # Get initial data and fit scalers
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=30)  # Get last 30 days for initial scaling
+    initial_data = fetcher.get_spy_data(start_date, end_date)
+    
+    if initial_data is not None:
+        initial_data = FinancialFeatureExtractor.calculate_features(initial_data)
+        predictor.fit_scalers(initial_data)
     
     while (datetime.now() - last_update).days <= days_to_run:
         try:
-            # Get latest data
             end_date = datetime.now()
             start_date = last_update
             
@@ -238,27 +337,20 @@ def run_continuous_training(api_key, days_to_run=30):
             
             if df is None or df.empty:
                 logging.warning("No new data available")
-                time.sleep(3600)  # Wait an hour before trying again
+                time.sleep(3600)
                 continue
             
-            # Calculate features
             df = FinancialFeatureExtractor.calculate_features(df)
             
-            # Update predictor
             for i in range(len(df) - 1):
                 features = df.iloc[i][predictor.feature_columns].values
                 next_price = df.iloc[i+1]['close']
                 error = predictor.update(features, next_price)
             
-            # Calculate and save daily metrics
             daily_metrics = performance_tracker.calculate_daily_metrics(
                 predictor, df['close'].values
             )
             
-            # Update plots
-            performance_tracker.plot_performance_evolution()
-            
-            # Save model state
             metadata = {
                 'last_update': end_date.isoformat(),
                 'total_training_steps': len(predictor.history['errors']),
@@ -267,26 +359,31 @@ def run_continuous_training(api_key, days_to_run=30):
             }
             model_state.save_state(predictor, metadata)
             
-            # Log progress
             logging.info(f"Training metrics for {end_date.date()}:")
             logging.info(f"MAE: ${daily_metrics['mae']:.2f}")
             logging.info(f"Direction Accuracy: {daily_metrics['correct_direction_pct']:.2%}")
             
-            # Wait until next day
-            time.sleep(3600)  # Check every hour for new data
+            time.sleep(3600)
             
         except Exception as e:
             logging.error(f"Error during training: {str(e)}")
-            time.sleep(3600)  # Wait an hour before retrying
+            time.sleep(3600)
 
 if __name__ == "__main__":
-    # Setup GitHub workflow
-    create_github_workflow()
-    
     # Get API key from environment variable
     api_key = os.getenv('FINNHUB_API_KEY')
     if not api_key:
         raise ValueError("Please set FINNHUB_API_KEY environment variable")
     
-    # Run continuous training
-    run_continuous_training(api_key)
+    logging.info("Starting SPY predictor training...")
+    try:
+        # Create initial directories if they don't exist
+        os.makedirs('model_state', exist_ok=True)
+        os.makedirs('performance', exist_ok=True)
+        
+        # Run continuous training for 30 days by default
+        run_continuous_training(api_key, days_to_run=30)
+        
+    except Exception as e:
+        logging.error(f"Error in main execution: {str(e)}")
+        raise e
