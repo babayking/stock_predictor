@@ -1,4 +1,4 @@
-name: SPY Predictor Training
+name: Stock Predictor Training
 
 on:
   schedule:
@@ -8,9 +8,13 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Explicitly set write permissions for repository contents
     
     steps:
     - uses: actions/checkout@v2
+      with:
+        persist-credentials: true  # Ensure credentials are preserved
     
     - name: Set up Python
       uses: actions/setup-python@v2
@@ -25,14 +29,15 @@ jobs:
     - name: Run predictor
       env:
         FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        STOCK_SYMBOL: ${{ secrets.STOCK_SYMBOL }}
       run: python spy_predictor.py
     
-- name: Commit changes
-  run: |
-    git config --local user.email "action@github.com"
-    git config --local user.name "GitHub Action"
-    git add model_state/* performance/*
-    git commit -m "Update model state and performance metrics" || echo "No changes to commit"
-    git push
-  env:
-    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Commit changes
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add model_state/* performance/* || true
+        git commit -m "Update model state and performance metrics" || echo "No changes to commit"
+        git push
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
