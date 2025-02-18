@@ -27,10 +27,12 @@ jobs:
         FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
       run: python spy_predictor.py
     
-    - name: Commit changes
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add model_state/* performance/*
-        git commit -m "Update model state and performance metrics" || echo "No changes to commit"
-        git push origin main
+- name: Commit changes
+  run: |
+    git config --local user.email "action@github.com"
+    git config --local user.name "GitHub Action"
+    git add model_state/* performance/*
+    git commit -m "Update model state and performance metrics" || echo "No changes to commit"
+    git push
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
