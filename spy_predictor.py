@@ -375,15 +375,67 @@ if __name__ == "__main__":
     if not api_key:
         raise ValueError("Please set FINNHUB_API_KEY environment variable")
     
-    logging.info("Starting SPY predictor training...")
+    logging.info("Starting SPY predictor training (batch mode)...")
     try:
         # Create initial directories if they don't exist
         os.makedirs('model_state', exist_ok=True)
         os.makedirs('performance', exist_ok=True)
         
-        # Run continuous training for 30 days by default
-        run_continuous_training(api_key, days_to_run=30)
+        # Setup objects
+        model_state = ModelState()
+        performance_tracker = PerformanceTracker()
+        predictor = SPYPredictor(feature_columns=[
+            'returns', 'volatility', 'rsi', 'macd',
+            'macd_signal', 'price_change'
+        ])
         
+        # Load previous state if available
+        metadata = model_state.load_state(predictor)
+        last_update = (datetime.fromisoformat(metadata['last_update']) 
+                    if metadata else datetime.now() - timedelta(days=30))
+        
+        # Get a single batch of data
+        fetcher = FinancialDataFetcher(api_key)
+        end_date = datetime.now()
+        
+        logging.info(f"Fetching data from {last_update} to {end_date}")
+        df = fetcher.get_spy_data(last_update, end_date)
+        
+        if df is not None and not df.empty:
+            # Process this batch
+            df = FinancialFeatureExtractor.calculate_features(df)
+            
+            # If first run, fit scalers
+            if not predictor.scalers:
+                predictor.fit_scalers(df)
+            
+            # Run training on this batch
+            for i in range(len(df) - 1):
+                features = df.iloc[i][predictor.feature_columns].values
+                next_price = df.iloc[i+1]['close']
+                error = predictor.update(features, next_price)
+            
+            # Calculate metrics
+            daily_metrics = performance_tracker.calculate_daily_metrics(
+                predictor, df['close'].values
+            )
+            
+            # Save state for next run
+            metadata = {
+                'last_update': end_date.isoformat(),
+                'total_training_steps': len(predictor.history['errors']),
+                'current_mae': daily_metrics['mae'],
+                'current_direction_accuracy': daily_metrics['correct_direction_pct']
+            }
+            model_state.save_state(predictor, metadata)
+            
+            # Log results
+            logging.info(f"Training metrics for {end_date.date()}:")
+            logging.info(f"MAE: ${daily_metrics['mae']:.2f}")
+            logging.info(f"Direction Accuracy: {daily_metrics['correct_direction_pct']:.2%}")
+        else:
+            logging.warning("No new data available")
+            
     except Exception as e:
-        logging.error(f"Error in main execution: {str(e)}")
+        logging.error(f"Error in batch execution: {str(e)}")
         raise e
